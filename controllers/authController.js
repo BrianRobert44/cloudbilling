@@ -1,0 +1,1069 @@
+
+const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const db = require("../config/db");
+const { JWT_SECRET } = require("../config/env");
+const { getAuth } = require("../config/firebase");
+const { notifySessionReplaced } = require("../services/socketService");
+
+/**
+ * Creates and stores a new unique active session ID for the user.
+ * Replaces any previous active session atomically and notifies older sessions via WebSocket.
+ */
+async function createActiveSession(userId) {
+  const sessionId = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  await db.query(
+    "UPDATE users SET active_session_id = ?, session_created_at = ? WHERE id = ?",
+    [sessionId, now, userId]
+  );
+
+  // Notify any existing connected sockets on other devices for this user
+  try {
+    await notifySessionReplaced(userId, sessionId);
+  } catch (err) {
+    console.error("Socket session replacement notification error:", err.message);
+  }
+
+  return sessionId;
+}
+
+// =====================================================
+// SAVE LOGIN ACTIVITY
+// =====================================================
+
+const saveLoginActivity = async (
+  req,
+  {
+    user = null,
+    email,
+    status,
+    failureReason = null,
+  }
+) => {
+  try {
+    const forwardedFor = req.headers["x-forwarded-for"];
+
+    const ipAddress = forwardedFor
+      ? String(forwardedFor).split(",")[0].trim()
+      : req.ip || null;
+
+    const deviceInfo = req.headers["user-agent"] || null;
+
+    await db.query(
+      `INSERT INTO login_activity
+      (
+        user_id,
+        business_id,
+        email,
+        role,
+        login_status,
+        ip_address,
+        device_info,
+        failure_reason
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        user?.id || null,
+        user?.business_id || null,
+        email,
+        user?.role || null,
+        status,
+        ipAddress,
+        deviceInfo,
+        failureReason,
+      ]
+    );
+  } catch (error) {
+    console.error("LOGIN ACTIVITY SAVE ERROR:", error.message);
+  }
+};
+
+// =====================================================
+// REGISTER
+// =====================================================
+
+const register = async (req, res) => {
+  try {
+    const {
+      name,
+      email,
+      password,
+      resetQuestion,
+      resetAnswer,
+    } = req.body;
+
+    if (
+      !name ||
+      !email ||
+      !password ||
+      !resetQuestion ||
+      !resetAnswer
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "All fields are required.",
+      });
+    }
+
+    if (
+      typeof name !== "string" ||
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      typeof resetQuestion !== "string" ||
+      typeof resetAnswer !== "string"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid input.",
+      });
+    }
+
+    const cleanName = name.trim();
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanQuestion = resetQuestion.trim();
+    const cleanAnswer = resetAnswer.trim().toLowerCase();
+
+    if (
+      !cleanName ||
+      !cleanEmail ||
+      !cleanQuestion ||
+      !cleanAnswer
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "All fields are required.",
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!emailRegex.test(cleanEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a valid email address.",
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 6 characters.",
+      });
+    }
+
+    if (!JWT_SECRET) {
+      return res.status(500).json({
+        success: false,
+        message: "Server configuration error.",
+      });
+    }
+
+    const [existingUsers] = await db.query(
+      "SELECT id FROM users WHERE email = ? LIMIT 1",
+      [cleanEmail]
+    );
+
+    if (existingUsers.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: "An account with this email already exists.",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const hashedAnswer = await bcrypt.hash(cleanAnswer, 10);
+
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    const [result] = await db.query(
+      `INSERT INTO users
+      (
+        name,
+        email,
+        password,
+        reset_question,
+        reset_answer,
+        trial_start_date,
+        trial_end_date,
+        subscription_status,
+        plan,
+        role,
+        is_active
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        cleanName,
+        cleanEmail,
+        hashedPassword,
+        cleanQuestion,
+        hashedAnswer,
+        todayStr,
+        trialEnd,
+        "TRIAL",
+        "FREE_TRIAL",
+        "USER",
+        1,
+      ]
+    );
+
+    const userId = result.insertId;
+
+    const sessionId = await createActiveSession(userId);
+
+    const token = jwt.sign(
+      {
+        id: userId,
+        userId,
+        role: "USER",
+        sessionId,
+      },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    return res.status(201).json({
+      success: true,
+      message: "Registration successful.",
+      token,
+      user: {
+        id: userId,
+        name: cleanName,
+        email: cleanEmail,
+        role: "USER",
+        subscriptionStatus: "TRIAL",
+        plan: "FREE_TRIAL",
+      },
+      trialDays: 7,
+    });
+  } catch (error) {
+    console.error("REGISTER ERROR:", error);
+
+    if (error.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({
+        success: false,
+        message: "An account with this email already exists.",
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: "Registration failed. Please try again.",
+    });
+  }
+};
+
+// =====================================================
+// LOGIN
+// =====================================================
+
+const login = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !email.trim() ||
+      !password
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and password are required.",
+      });
+    }
+
+    if (!JWT_SECRET) {
+      console.error("JWT_SECRET is missing.");
+
+      return res.status(500).json({
+        success: false,
+        message: "Server configuration error.",
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
+    // Find user
+    const [users] = await db.query(
+      `SELECT
+        id,
+        business_id,
+        name,
+        email,
+        password,
+        role,
+        is_active,
+        trial_start_date,
+        trial_end_date,
+        subscription_status,
+        plan,
+        subscription_end_date
+      FROM users
+      WHERE email = ?
+      LIMIT 1`,
+      [cleanEmail]
+    );
+
+    // User not found
+    if (users.length === 0) {
+      await saveLoginActivity(req, {
+        email: cleanEmail,
+        status: "FAILED",
+        failureReason: "User not found",
+      });
+
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password.",
+      });
+    }
+
+    const user = users[0];
+
+    // Verify password
+    const passwordMatch = await bcrypt.compare(
+      password,
+      user.password
+    );
+
+    if (!passwordMatch) {
+      await saveLoginActivity(req, {
+        user,
+        email: cleanEmail,
+        status: "FAILED",
+        failureReason: "Invalid password",
+      });
+
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password.",
+      });
+    }
+
+    // Check account status
+    if (Number(user.is_active) !== 1) {
+      await saveLoginActivity(req, {
+        user,
+        email: cleanEmail,
+        status: "FAILED",
+        failureReason: "Account deactivated",
+      });
+
+      return res.status(403).json({
+        success: false,
+        message: "Your account is deactivated.",
+      });
+    }
+
+    const role = String(user.role || "USER").toUpperCase();
+    const isAdmin = ["ADMIN", "SUPER_ADMIN"].includes(role);
+
+    let currentStatus = user.subscription_status;
+    let accessAllowed = false;
+
+    // ADMIN & SUPER_ADMIN: bypass trial expiry
+    if (isAdmin) {
+      accessAllowed = true;
+      currentStatus = "ACTIVE";
+
+      if (user.subscription_status !== "ACTIVE") {
+        await db.query(
+          `UPDATE users
+           SET subscription_status = 'ACTIVE'
+           WHERE id = ?`,
+          [user.id]
+        );
+      }
+    } else {
+      // Normal user trial validation
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      let trialEndDate = null;
+
+      if (user.trial_end_date) {
+        trialEndDate = new Date(user.trial_end_date);
+        trialEndDate.setHours(0, 0, 0, 0);
+      }
+
+      if (trialEndDate && today <= trialEndDate) {
+        accessAllowed = true;
+        currentStatus = "TRIAL";
+
+        if (user.subscription_status !== "TRIAL") {
+          await db.query(
+            `UPDATE users
+             SET subscription_status = 'TRIAL'
+             WHERE id = ? AND role <> 'ADMIN'`,
+            [user.id]
+          );
+        }
+      } else {
+        let subscriptionEndDate = null;
+
+        if (user.subscription_end_date) {
+          subscriptionEndDate = new Date(
+            user.subscription_end_date
+          );
+
+          subscriptionEndDate.setHours(0, 0, 0, 0);
+        }
+
+        if (
+          user.subscription_status === "ACTIVE" &&
+          subscriptionEndDate &&
+          today <= subscriptionEndDate
+        ) {
+          accessAllowed = true;
+          currentStatus = "ACTIVE";
+        } else {
+          accessAllowed = false;
+          currentStatus = "EXPIRED";
+
+          await db.query(
+            `UPDATE users
+             SET subscription_status = 'EXPIRED'
+             WHERE id = ? AND role <> 'ADMIN'`,
+            [user.id]
+          );
+        }
+      }
+    }
+
+    // Trial expired
+    if (!accessAllowed) {
+      await saveLoginActivity(req, {
+        user,
+        email: cleanEmail,
+        status: "FAILED",
+        failureReason: "Trial or subscription expired",
+      });
+
+      return res.status(403).json({
+        success: false,
+        message:
+          "Your free trial has expired. Please subscribe to continue.",
+        status: "TRIAL_EXPIRED",
+        subscription_status: "EXPIRED",
+      });
+    }
+
+    // Create unique active session ID (invalidates any older device login)
+    const sessionId = await createActiveSession(user.id);
+
+    // Create JWT with session ID
+    const token = jwt.sign(
+      {
+        id: user.id,
+        userId: user.id,
+        businessId: user.business_id || null,
+        role,
+        sessionId,
+      },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    // Save successful login activity
+    await saveLoginActivity(req, {
+      user,
+      email: cleanEmail,
+      status: "SUCCESS",
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Login successful.",
+      token,
+      user: {
+        id: user.id,
+        businessId: user.business_id || null,
+        name: user.name,
+        email: user.email,
+        role,
+        trialStartDate: user.trial_start_date,
+        trialEndDate: user.trial_end_date,
+        subscriptionStatus: currentStatus,
+        plan: user.plan,
+        subscriptionEndDate: user.subscription_end_date,
+        business: null,
+      },
+    });
+  } catch (error) {
+    console.error("LOGIN ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Login failed. Please try again.",
+    });
+  }
+};
+
+// =====================================================
+// FORGOT PASSWORD - GET SECURITY QUESTION
+// =====================================================
+
+const getSecurityQuestion = async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (
+      typeof email !== "string" ||
+      !email.trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Email is required.",
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
+    const [users] = await db.query(
+      `SELECT reset_question
+       FROM users
+       WHERE email = ?
+       LIMIT 1`,
+      [cleanEmail]
+    );
+
+    if (
+      !users.length ||
+      !users[0].reset_question
+    ) {
+      return res.status(404).json({
+        success: false,
+        message: "Account or security question not found.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      question: users[0].reset_question,
+    });
+  } catch (error) {
+    console.error("SECURITY QUESTION ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to get security question.",
+    });
+  }
+};
+
+// =====================================================
+// RESET PASSWORD
+// =====================================================
+
+const resetPassword = async (req, res) => {
+  try {
+    const {
+      email,
+      answer,
+      newPassword,
+      confirmPassword,
+    } = req.body;
+
+    if (
+      typeof email !== "string" ||
+      typeof answer !== "string" ||
+      typeof newPassword !== "string" ||
+      typeof confirmPassword !== "string" ||
+      !email.trim() ||
+      !answer.trim() ||
+      !newPassword ||
+      !confirmPassword
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "All fields are required.",
+      });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        message: "Passwords do not match.",
+      });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must contain at least 8 characters.",
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanAnswer = answer.trim().toLowerCase();
+
+    const [users] = await db.query(
+      `SELECT id, reset_answer
+       FROM users
+       WHERE email = ?
+       LIMIT 1`,
+      [cleanEmail]
+    );
+
+    if (
+      !users.length ||
+      !users[0].reset_answer
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid account or security answer.",
+      });
+    }
+
+    // Verify security answer
+    const validAnswer = await bcrypt.compare(
+      cleanAnswer,
+      users[0].reset_answer
+    );
+
+    if (!validAnswer) {
+      return res.status(400).json({
+        success: false,
+        message: "Incorrect security answer.",
+      });
+    }
+
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(
+      newPassword,
+      10
+    );
+
+    await db.query(
+      "UPDATE users SET password = ? WHERE id = ?",
+      [hashedPassword, users[0].id]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Password reset successfully. Please login again.",
+    });
+  } catch (error) {
+    console.error("RESET PASSWORD ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Password reset failed.",
+    });
+  }
+};
+
+// =====================================================
+// GOOGLE SIGN IN / LOGIN
+// =====================================================
+
+const googleLogin = async (req, res) => {
+  try {
+    const { idToken } = req.body;
+
+    if (!idToken || typeof idToken !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "Google ID token is required.",
+      });
+    }
+
+    if (!JWT_SECRET) {
+      console.error("JWT_SECRET is missing.");
+      return res.status(500).json({
+        success: false,
+        message: "Server configuration error.",
+      });
+    }
+
+    // Verify token using firebase-admin Auth
+    let decodedToken;
+    try {
+      const auth = getAuth();
+      decodedToken = await auth.verifyIdToken(idToken);
+    } catch (authErr) {
+      console.error("FIREBASE GOOGLE TOKEN VERIFY ERROR:", authErr.message);
+      return res.status(401).json({
+        success: false,
+        message: "Invalid or expired Google token. Please try again.",
+      });
+    }
+
+    const { uid, email, name, picture } = decodedToken;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "Google account does not have a verified email address.",
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanName = (name || cleanEmail.split("@")[0] || "User").trim();
+
+    // Check if user already exists
+    const [existingUsers] = await db.query(
+      `SELECT
+        id,
+        business_id,
+        name,
+        email,
+        role,
+        is_active,
+        trial_start_date,
+        trial_end_date,
+        subscription_status,
+        plan,
+        subscription_end_date
+      FROM users
+      WHERE email = ?
+      LIMIT 1`,
+      [cleanEmail]
+    );
+
+    let user;
+    let isNewUser = false;
+
+    if (existingUsers.length > 0) {
+      user = existingUsers[0];
+
+      if (Number(user.is_active) !== 1) {
+        await saveLoginActivity(req, {
+          user,
+          email: cleanEmail,
+          status: "FAILED",
+          failureReason: "Account deactivated",
+        });
+
+        return res.status(403).json({
+          success: false,
+          message: "Your account is deactivated.",
+        });
+      }
+
+      const role = String(user.role || "USER").toUpperCase();
+      const isAdmin = ["ADMIN", "SUPER_ADMIN"].includes(role);
+
+      let currentStatus = user.subscription_status;
+      let accessAllowed = false;
+
+      if (isAdmin) {
+        accessAllowed = true;
+        currentStatus = "ACTIVE";
+
+        if (user.subscription_status !== "ACTIVE") {
+          await db.query(
+            `UPDATE users SET subscription_status = 'ACTIVE' WHERE id = ?`,
+            [user.id]
+          );
+        }
+      } else {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        let trialEndDate = null;
+        if (user.trial_end_date) {
+          trialEndDate = new Date(user.trial_end_date);
+          trialEndDate.setHours(0, 0, 0, 0);
+        }
+
+        if (trialEndDate && today <= trialEndDate) {
+          accessAllowed = true;
+          currentStatus = "TRIAL";
+
+          if (user.subscription_status !== "TRIAL") {
+            await db.query(
+              `UPDATE users SET subscription_status = 'TRIAL' WHERE id = ? AND role <> 'ADMIN'`,
+              [user.id]
+            );
+          }
+        } else {
+          let subscriptionEndDate = null;
+          if (user.subscription_end_date) {
+            subscriptionEndDate = new Date(user.subscription_end_date);
+            subscriptionEndDate.setHours(0, 0, 0, 0);
+          }
+
+          if (
+            user.subscription_status === "ACTIVE" &&
+            subscriptionEndDate &&
+            today <= subscriptionEndDate
+          ) {
+            accessAllowed = true;
+            currentStatus = "ACTIVE";
+          } else {
+            accessAllowed = false;
+            currentStatus = "EXPIRED";
+
+            await db.query(
+              `UPDATE users SET subscription_status = 'EXPIRED' WHERE id = ? AND role <> 'ADMIN'`,
+              [user.id]
+            );
+          }
+        }
+      }
+
+      if (!accessAllowed) {
+        await saveLoginActivity(req, {
+          user,
+          email: cleanEmail,
+          status: "FAILED",
+          failureReason: "Trial or subscription expired",
+        });
+
+        return res.status(403).json({
+          success: false,
+          message: "Your free trial has expired. Please subscribe to continue.",
+          status: "TRIAL_EXPIRED",
+          subscription_status: "EXPIRED",
+        });
+      }
+    } else {
+      // Create new user with 7-day trial!
+      isNewUser = true;
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const randomPassword = await bcrypt.hash(uid + "_" + Math.random().toString(), 10);
+      const randomAnswer = await bcrypt.hash("GoogleAuthVerified", 10);
+
+      const [userResult] = await db.query(
+        `INSERT INTO users
+        (
+          name,
+          email,
+          password,
+          reset_question,
+          reset_answer,
+          trial_start_date,
+          trial_end_date,
+          subscription_status,
+          plan,
+          role,
+          is_active
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          cleanName,
+          cleanEmail,
+          randomPassword,
+          "Google Authentication",
+          randomAnswer,
+          todayStr,
+          trialEnd,
+          "TRIAL",
+          "FREE_TRIAL",
+          "USER",
+          1,
+        ]
+      );
+
+      const newUserId = userResult.insertId;
+
+      // Auto-create business
+      const [bizResult] = await db.query(
+        `INSERT INTO businesses (
+          user_id, business_name, owner_name, email,
+          mobile, business_type, state, invoice_prefix, invoice_next_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          newUserId,
+          `${cleanName}'s Store`,
+          cleanName,
+          cleanEmail,
+          "9876543210",
+          "Retail",
+          "Tamil Nadu",
+          "INV",
+          1,
+        ]
+      );
+
+      const newBizId = bizResult.insertId;
+
+      // Attach business_id to user
+      await db.query(
+        `UPDATE users SET business_id = ? WHERE id = ?`,
+        [newBizId, newUserId]
+      );
+
+      // Create initial settings
+      try {
+        await db.query(
+          `INSERT INTO business_settings (
+            user_id, business_name, owner_name, email, phone,
+            invoice_prefix, default_gst, currency, email_notifications, invoice_notifications
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            newUserId,
+            `${cleanName}'s Store`,
+            cleanName,
+            cleanEmail,
+            "9876543210",
+            "INV",
+            18,
+            "INR",
+            1,
+            1,
+          ]
+        );
+      } catch (settingsErr) {
+        console.warn("Google user initial settings creation note:", settingsErr.message);
+      }
+
+      // Create default counter
+      try {
+        await db.query(
+          `INSERT INTO counters (business_id, name, counter_number, status)
+           VALUES (?, ?, ?, ?)`,
+          [newBizId, "Counter 1", "C-01", "ACTIVE"]
+        );
+      } catch (counterErr) {
+        console.warn("Google user initial counter creation note:", counterErr.message);
+      }
+
+      user = {
+        id: newUserId,
+        business_id: newBizId,
+        name: cleanName,
+        email: cleanEmail,
+        role: "USER",
+        subscription_status: "TRIAL",
+        plan: "FREE_TRIAL",
+        trial_start_date: todayStr,
+        trial_end_date: trialEnd,
+        subscription_end_date: null,
+      };
+    }
+
+    const role = String(user.role || "USER").toUpperCase();
+
+    // Create unique active session ID (invalidates any older device login)
+    const sessionId = await createActiveSession(user.id);
+
+    // Create JWT with session ID
+    const token = jwt.sign(
+      {
+        id: user.id,
+        userId: user.id,
+        businessId: user.business_id || null,
+        role,
+        sessionId,
+      },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    // Save successful login activity
+    await saveLoginActivity(req, {
+      user,
+      email: cleanEmail,
+      status: "SUCCESS",
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: isNewUser
+        ? "Account created and logged in with Google!"
+        : "Login successful with Google.",
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role,
+        business_id: user.business_id || null,
+        subscription_status: user.subscription_status,
+        plan: user.plan || "FREE_TRIAL",
+        trial_end_date: user.trial_end_date,
+        subscription_end_date: user.subscription_end_date,
+        picture: picture || null,
+      },
+      isNewUser,
+    });
+  } catch (error) {
+    console.error("GOOGLE LOGIN CONTROLLER ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Google login failed. Please try again.",
+    });
+  }
+};
+
+// =====================================================
+// LOGOUT (INVALIDATE ACTIVE SESSION)
+// =====================================================
+
+const logout = async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?.userId;
+    const requestSessionId = req.user?.sessionId;
+
+    if (userId && requestSessionId) {
+      // Fetch user's current active session
+      const [users] = await db.query(
+        "SELECT id, active_session_id FROM users WHERE id = ? LIMIT 1",
+        [userId]
+      );
+
+      // Only invalidate if the session logging out matches the active session.
+      // This prevents an older session from accidentally invalidating a newer active session!
+      if (users.length && users[0].active_session_id === requestSessionId) {
+        await db.query(
+          "UPDATE users SET active_session_id = NULL WHERE id = ?",
+          [userId]
+        );
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Logged out successfully.",
+    });
+  } catch (error) {
+    console.error("LOGOUT ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Logout error.",
+    });
+  }
+};
+
+// =====================================================
+// SESSION CHECK (LIGHTWEIGHT VERIFICATION)
+// =====================================================
+
+const sessionCheck = async (req, res) => {
+  // If request reached this handler, authMiddleware already verified
+  // that the token's sessionId matches the user's active_session_id.
+  return res.status(200).json({
+    success: true,
+    active: true,
+    user: {
+      id: req.user.id,
+      name: req.user.name,
+      email: req.user.email,
+      role: req.user.role,
+      businessId: req.user.businessId,
+      subscriptionStatus: req.user.subscription_status,
+      sessionId: req.user.sessionId,
+    },
+  });
+};
+
+// =====================================================
+// EXPORT
+// =====================================================
+
+module.exports = {
+  register,
+  login,
+  googleLogin,
+  getSecurityQuestion,
+  resetPassword,
+  logout,
+  sessionCheck,
+};
